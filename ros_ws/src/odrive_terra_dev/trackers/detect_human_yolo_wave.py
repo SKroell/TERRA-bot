@@ -8,6 +8,10 @@ import numpy as np
 from ultralytics import YOLO
 import time
 from scipy.spatial import distance
+import logging
+from ultralytics.utils.ops import scale_coords
+
+
 
 class DetectHuman(Node):
 
@@ -16,7 +20,7 @@ class DetectHuman(Node):
 
         self.get_logger().info('Looking for a human...')
         self.image_sub = self.create_subscription(CompressedImage, "/image_in", self.callback, 10)
-        self.image_out_pub = self.create_publisher(CompressedImage, "/image_out", 1)
+        self.image_out_pub = self.create_publisher(CompressedImage, "/image_out/compressed", 1)
         self.human_pub = self.create_publisher(Point, "/detected_human", 1)
 
         self.bridge = CvBridge()
@@ -28,28 +32,29 @@ class DetectHuman(Node):
 
         self.tracking_human = False
         self.tracked_human_id = None
-        self.wait_time = 10  # seconds to wait before looking for a new human
+        self.wait_time = 0  # seconds to wait before looking for a new human
         self.last_detection_time = time.time()
+        self.cv_image = None
 
     def callback(self, data):
+        self.get_logger().set_level(logging.WARNING)
         current_time = time.time()
         if self.tracking_human and (current_time - self.last_detection_time < self.wait_time):
             return  # Skip processing if currently tracking a human and within wait time
 
         try:
             np_arr = np.frombuffer(data.data, np.uint8)
-            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            self.cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridge Error: {e}')
             return
 
         try:
-            results = self.model(cv_image)
+            results = self.model(self.cv_image, verbose=False)
             boxes = results[0].boxes.xyxy.cpu().numpy()  # Bounding boxes
             confidences = results[0].boxes.conf.cpu().numpy()  # Confidences
             class_ids = results[0].boxes.cls.cpu().numpy()  # Class IDs
-            keypoints = results[0].keypoints.cpu().numpy()  # Keypoints for pose estimation
-
+            keypoints = results[0].keypoints.xy.cpu().numpy()  # Keypoints for pose estimation
             detected_humans = []
 
             for box, confidence, class_id, kps in zip(boxes, confidences, class_ids, keypoints):
@@ -62,33 +67,34 @@ class DetectHuman(Node):
                         'id': None  # Placeholder for unique ID
                     })
                     label = f'Person: {confidence:.2f}'
-                    cv_image = self.draw_keypoints(cv_image, kps)
-                    cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(cv_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    self.draw_keypoints(kps, box)
+                    cv2.rectangle(self.cv_image, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(self.cv_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Create CompressedImage for visualization
             msg = CompressedImage()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.format = "jpeg"
-            msg.data = np.array(cv2.imencode('.jpg', cv_image)[1]).tobytes()
+            msg.data = np.array(cv2.imencode('.jpg', self.cv_image)[1]).tobytes()
             self.image_out_pub.publish(msg)
 
-            if self.tracking_human:
-                # Track the same human based on the closest keypoints match
-                tracked_human = self.track_human(detected_humans)
-                if tracked_human:
-                    self.update_tracking(tracked_human)
-            else:
-                # Check for waving gesture in detected humans and start tracking
-                for human in detected_humans:
+            #if self.tracking_human:
+            # Track the same human based on the closest keypoints match
+            tracked_human = self.track_human(detected_humans)
+            if tracked_human:
+                self.update_tracking(tracked_human)
+            #else:
+            # Check for waving gesture in detected humans and start tracking
+            for human in detected_humans:
+                if len(human['keypoints']) > 9:
                     if self.is_waving(human['keypoints']):
                         self.start_tracking(human, current_time)
                         break
 
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridge Error: {e}')
-        except Exception as e:
-            self.get_logger().error(f'Error: {e}')
+        except Exception as e: # output line number of error
+            self.get_logger().error(f'Error: {e} on line {e.__traceback__.tb_lineno}')
 
     def track_human(self, detected_humans):
         """Track the same human based on keypoints."""
@@ -109,6 +115,7 @@ class DetectHuman(Node):
 
     def start_tracking(self, human, current_time):
         """Start tracking a new human."""
+        print("Starting tracking...")
         self.tracking_human = True
         self.tracked_human_id = id(human)
         self.tracked_keypoints = human['keypoints']
@@ -117,12 +124,13 @@ class DetectHuman(Node):
 
     def update_tracking(self, human):
         """Update tracking information."""
+        print("Update tracking")
         box = human['box']
         point_out = Point()
         point_out.x = box[0] + box[2] / 2
         point_out.y = box[1] + box[3] / 2
         point_out.z = float(box[2] * box[3])
-        normalized_point = self.normalize_coordinates(self.cv_image, point_out.x, point_out.y)
+        normalized_point = self.normalize_coordinates(self.cv_image, point_out.x, point_out.y, point_out.z)
         self.human_pub.publish(normalized_point)
         self.get_logger().info(f"Tracking human ID {self.tracked_human_id} at coordinates (x: {point_out.x}, y: {point_out.y}, z: {point_out.z})")
 
@@ -133,23 +141,30 @@ class DetectHuman(Node):
         nose = keypoints[0]  # Assuming keypoints[0] is nose
 
         # Simple heuristic: wrist above nose level indicates a waving gesture
+        #print(f'Left wrist: {left_wrist}, Right wrist: {right_wrist}, Nose: {nose}')
         if left_wrist[1] < nose[1] or right_wrist[1] < nose[1]:
             return True
+            print("Waving detected!")
         return False
 
-    def draw_keypoints(self, image, keypoints):
+    def draw_keypoints(self, keypoints, box):
         """Draw keypoints on the image."""
-        for kp in keypoints:
+        for index, kp in enumerate(keypoints):
+            #print(kp)
             x, y = int(kp[0]), int(kp[1])
-            cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
-        return image
+            cv2.circle(self.cv_image, (x, y), radius=3, color=(0, 255, 0), thickness=-1)
+            # write index of keypoint on the image
+            cv2.putText(self.cv_image, str(index), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    def normalize_coordinates(self, image, x, y):
+
+
+    def normalize_coordinates(self, image, x, y, z):
         """Normalize the coordinates based on image dimensions."""
         height, width, _ = image.shape
         normalized_x = (x - (width / 2)) / (width / 2)
         normalized_y = (y - (height / 2)) / (height / 2)
-        return Point(x=normalized_x, y=normalized_y, z=1.0)
+        normalized_z = (z - 0) / (width * height)
+        return Point(x=normalized_x, y=normalized_y, z=normalized_z)
 
 def main(args=None):
     rclpy.init(args=args)

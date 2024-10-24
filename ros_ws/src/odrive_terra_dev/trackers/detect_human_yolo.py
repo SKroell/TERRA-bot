@@ -1,3 +1,4 @@
+from trackers import BaseHumanDetection
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
@@ -7,20 +8,13 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-class DetectHuman(Node):
-
-    def __init__(self):
-        super().__init__('detect_human')
-
-        self.get_logger().info('Looking for a human...')
-        self.image_sub = self.create_subscription(CompressedImage, "/image_in", self.callback, 10)
-        self.image_out_pub = self.create_publisher(CompressedImage, "/image_out", 1)
-        self.human_pub = self.create_publisher(Point, "/detected_human", 1)
-
-        self.bridge = CvBridge()
-
+# YOLO-Based Human Detection Class
+class DetectHumanYOLO(BaseHumanDetection):
+    def __init__(self, yolo_model_path="yolov8n.pt"):
+        super().__init__('detect_human_yolo', '/image_in', '/image_out/compressed', '/detected_human')
+        
         # Load YOLOv8 model
-        self.model = YOLO("yolov8n.pt")  # Use the yolov8n model (nano) for better speed
+        self.model = YOLO(yolo_model_path)  
         self.conf_threshold = 0.5  # Confidence threshold
         self.nms_threshold = 0.4  # NMS threshold
 
@@ -43,14 +37,12 @@ class DetectHuman(Node):
             human_confidences = []
 
             for box, confidence, class_id in zip(boxes, confidences, class_ids):
-                if confidence > self.conf_threshold:
-                    x1, y1, x2, y2 = box.astype(int)
-                    if int(class_id) == 0:  # class_id == 0 for 'person'
-                        human_boxes.append([x1, y1, x2 - x1, y2 - y1])
-                        human_confidences.append(float(confidence))
+                if confidence > self.conf_threshold and int(class_id) == 0:  # class_id == 0 for 'person'
+                    human_boxes.append([box[0], box[1], box[2] - box[0], box[3] - box[1]])
+                    human_confidences.append(float(confidence))
                     label = f'{class_names[int(class_id)]}: {confidence:.2f}'
-                    cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(cv_image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    cv2.rectangle(cv_image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 0, 255), 2)
+                    cv2.putText(cv_image, label, (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Create CompressedImage
             msg = CompressedImage()
@@ -79,22 +71,15 @@ class DetectHuman(Node):
                 normalized_point = self.normalize_coordinates(cv_image, point_out.x, point_out.y)
                 self.human_pub.publish(normalized_point)
                 self.get_logger().info(f"Human detected at coordinates (x: {point_out.x}, y: {point_out.y}, z: {point_out.z})")
+
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridge Error: {e}')
         except Exception as e:
             self.get_logger().error(f'Error: {e}')
 
-    def normalize_coordinates(self, image, x, y, z):
-        """Normalize the coordinates based on image dimensions."""
-        height, width, _ = image.shape
-        normalized_x = (x - (width / 2)) / (width / 2)
-        normalized_y = (y - (height / 2)) / (height / 2)
-        normalized_z = z / (width * height)
-        return Point(x=normalized_x, y=normalized_y, z=1.0)
-
 def main(args=None):
     rclpy.init(args=args)
-    detect_human = DetectHuman()
-    rclpy.spin(detect_human)
-    detect_human.destroy_node()
+    detect_human_yolo = DetectHumanYOLO()
+    rclpy.spin(detect_human_yolo)
+    detect_human_yolo.destroy_node()
     rclpy.shutdown()
